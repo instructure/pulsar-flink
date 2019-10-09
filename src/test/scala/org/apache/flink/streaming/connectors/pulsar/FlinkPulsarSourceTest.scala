@@ -29,7 +29,7 @@ import org.apache.flink.streaming.api.functions.source.SourceFunction
 import org.apache.flink.streaming.api.functions.source.SourceFunction.SourceContext
 import org.apache.flink.streaming.api.functions.{AssignerWithPeriodicWatermarks, AssignerWithPunctuatedWatermarks}
 import org.apache.flink.streaming.api.operators.{StreamSource, StreamingRuntimeContext}
-import org.apache.flink.streaming.connectors.pulsar.internal.{ClosedException, PulsarCommitCallback, PulsarFetcher, PulsarMetadataReader}
+import org.apache.flink.streaming.connectors.pulsar.internal.{ClosedException, Deserializer, JSONOptionsInRead, PulsarCommitCallback, PulsarFetcher, PulsarMetadataReader, PulsarRowDeserializer}
 import org.apache.flink.streaming.connectors.pulsar.internals.{PulsarFunSuite, TestMetadataReader}
 import org.apache.flink.streaming.connectors.pulsar.testutils.TestSourceContext
 import org.apache.flink.streaming.runtime.tasks.{ProcessingTimeService, TestProcessingTimeService}
@@ -39,6 +39,7 @@ import org.apache.flink.util.{ExceptionUtils, FlinkException, Preconditions, Ser
 import org.apache.flink.util.function.{SupplierWithException, ThrowingRunnable}
 import org.apache.pulsar.client.api.MessageId
 import org.apache.pulsar.client.impl.MessageIdImpl
+import org.apache.pulsar.common.schema.SchemaInfo
 import org.mockito.Mockito.{doThrow, mock, when}
 import org.mockito.invocation.InvocationOnMock
 import org.mockito.stubbing.Answer
@@ -138,19 +139,19 @@ class FlinkPulsarSourceTest extends PulsarFunSuite with MockitoSugar {
     }
     runThread.start()
     fetcher.waitUntilRun()
-    assert(0 == source.getPendingOffsetsToCommit().size())
+    assert(0 == source.getPendingOffsetsToCommit.size())
 
     // checkpoint 1
     source.snapshotState(new StateSnapshotContextSynchronousImpl(138, 138))
     val snap1 = listState.get.asScala.map(t => t.f0 -> t.f1).toMap
     assert(snap1 == state1)
-    assert(1 == source.getPendingOffsetsToCommit().size())
+    assert(1 == source.getPendingOffsetsToCommit.size())
 
     // checkpoint 2
     source.snapshotState(new StateSnapshotContextSynchronousImpl(140, 140))
     val snap2 = listState.get.asScala.map(t => t.f0 -> t.f1).toMap
     assert(snap2 == state2)
-    assert(2 == source.getPendingOffsetsToCommit().size())
+    assert(2 == source.getPendingOffsetsToCommit.size())
 
     // ack checkpoint 1
     source.notifyCheckpointComplete(138L)
@@ -161,7 +162,7 @@ class FlinkPulsarSourceTest extends PulsarFunSuite with MockitoSugar {
     source.snapshotState(new StateSnapshotContextSynchronousImpl(141, 141))
     val snap3 = listState.get.asScala.map(t => t.f0 -> t.f1).toMap
     assert(snap3 == state3)
-    assert(2 == source.getPendingOffsetsToCommit().size())
+    assert(2 == source.getPendingOffsetsToCommit.size())
 
     source.notifyCheckpointComplete(141L)
     assert(2 == fetcher.getCommitCount())
@@ -186,8 +187,8 @@ class FlinkPulsarSourceTest extends PulsarFunSuite with MockitoSugar {
   test("close discoverer when create fetcher fails") {
     val failureCause = new FlinkException("create fetcher failure")
     val discoverer = new DummyPartitionDiscoverer
-    val source = new DummyFlinkPulsarSource(new SupplierWithException[PulsarFetcher, Exception] {
-      override def get(): PulsarFetcher = throw failureCause
+    val source = new DummyFlinkPulsarSource(new SupplierWithException[PulsarFetcher[Row], Exception] {
+      override def get(): PulsarFetcher[Row] = throw failureCause
     },
       discoverer, 100)
     testFailingSourceLifecycle(source, failureCause)
@@ -197,10 +198,10 @@ class FlinkPulsarSourceTest extends PulsarFunSuite with MockitoSugar {
   test("close discoverer when fetcher fails") {
     val failure = new FlinkException("Run fetcher failure")
     val discoverer = new DummyPartitionDiscoverer
-    val mockFetcher = mock[PulsarFetcher]
+    val mockFetcher = mock[PulsarFetcher[Row]]
     when(mockFetcher.runFetchLoop()).thenThrow(failure)
-    val source = new DummyFlinkPulsarSource(new SupplierWithException[PulsarFetcher, Exception] {
-      override def get(): PulsarFetcher = mockFetcher
+    val source = new DummyFlinkPulsarSource(new SupplierWithException[PulsarFetcher[Row], Exception] {
+      override def get(): PulsarFetcher[Row] = mockFetcher
     }, discoverer, 100)
     testFailingSourceLifecycle(source, failure)
     assert(discoverer.isClosed())
@@ -415,7 +416,9 @@ class TestingFetcher(
     watermarksPunctuated,
     processingTimeProvider,
     autoWatermarkInterval,
-    getClass.getClassLoader, null, "", null, null, null, 0, null) {
+    getClass.getClassLoader,
+    null, "", null, null, null, 0, null,
+    (schemaInfo, jsonOptions) => new PulsarRowDeserializer(schemaInfo, jsonOptions)) {
 
   @volatile var isRunning: Boolean = true
 
@@ -444,7 +447,7 @@ class TestingFlinkPulsarSource(discoverer: PulsarMetadataReader, discoveryInterv
     watermarksPunctuated: SerializedValue[AssignerWithPunctuatedWatermarks[Row]],
     processingTimeProvider: ProcessingTimeService,
     autoWatermarkInterval: Long, userCodeClassLoader: ClassLoader,
-    streamingRuntime: StreamingRuntimeContext): PulsarFetcher = {
+    streamingRuntime: StreamingRuntimeContext): PulsarFetcher[Row] = {
 
     new TestingFetcher(sourceContext,
       seedTopicsWithInitialOffsets,
@@ -457,6 +460,9 @@ class TestingFlinkPulsarSource(discoverer: PulsarMetadataReader, discoveryInterv
   override protected def createTopicDiscoverer(): PulsarMetadataReader = {
     discoverer
   }
+
+  // never called as we override createFetcher
+  override protected def buildDeserializer(pulsrSchema: SchemaInfo, jsonOpts: JSONOptionsInRead): Deserializer[Row] = ???
 }
 
 class TestingListState[T] extends ListState[T] {
@@ -496,14 +502,16 @@ class TestingListState[T] extends ListState[T] {
 
 class MockFetcher(
   states: Seq[util.Map[String, MessageId]])
-  extends PulsarFetcher(
+  extends PulsarFetcher[Row](
     new TestSourceContext[Row](),
     Map.empty[String, MessageId],
     null,
     null,
     new TestProcessingTimeService(),
     0,
-    classOf[MockFetcher].getClassLoader, null, "", null, null, null, 0, null) {
+    classOf[PulsarFetcher[Row]].getClassLoader,
+    null, "", null, null, null, 0, null,
+    (schemaInfo, jsonOptions) => new PulsarRowDeserializer(schemaInfo, jsonOptions)) {
 
   val runLatch = new OneShotLatch()
   val stopLatch = new OneShotLatch()
@@ -593,26 +601,26 @@ class MockOperatorStateStore(mockRestoredUnionListState: ListState[_]) extends O
 }
 
 class DummyFlinkPulsarSource(
-  testFetcherSupplier: SupplierWithException[PulsarFetcher, Exception],
+  testFetcherSupplier: SupplierWithException[PulsarFetcher[Row], Exception],
   discoverer: PulsarMetadataReader,
   discoveryIntervalMs: Int)
   extends FlinkPulsarSource(FlinkPulsarSourceTest.dummyProperties) {
 
   def this() = this(
-    new SupplierWithException[PulsarFetcher, Exception] {
-      override def get() = mock(classOf[PulsarFetcher])
+    new SupplierWithException[PulsarFetcher[Row], Exception] {
+      override def get() = mock(classOf[PulsarFetcher[Row]])
     },
     mock(classOf[PulsarMetadataReader]), -1)
 
   def this(discoverer: PulsarMetadataReader) = this(
-    new SupplierWithException[PulsarFetcher, Exception] {
-      override def get(): PulsarFetcher = mock(classOf[PulsarFetcher])
+    new SupplierWithException[PulsarFetcher[Row], Exception] {
+      override def get(): PulsarFetcher[Row] = mock(classOf[PulsarFetcher[Row]])
     },
     discoverer, -1)
 
-  def this(fetcher: PulsarFetcher, discoverer: PulsarMetadataReader) = this(
-    new SupplierWithException[PulsarFetcher, Exception] {
-      override def get(): PulsarFetcher = fetcher
+  def this(fetcher: PulsarFetcher[Row], discoverer: PulsarMetadataReader) = this(
+    new SupplierWithException[PulsarFetcher[Row], Exception] {
+      override def get(): PulsarFetcher[Row] = fetcher
     }, discoverer, -1)
 
   override protected def createFetcher(
@@ -622,13 +630,16 @@ class DummyFlinkPulsarSource(
     watermarksPunctuated: SerializedValue[AssignerWithPunctuatedWatermarks[Row]],
     processingTimeProvider: ProcessingTimeService,
     autoWatermarkInterval: Long, userCodeClassLoader: ClassLoader,
-    streamingRuntime: StreamingRuntimeContext): PulsarFetcher = {
+    streamingRuntime: StreamingRuntimeContext): PulsarFetcher[Row] = {
     testFetcherSupplier.get()
   }
 
   override protected def createTopicDiscoverer(): PulsarMetadataReader = {
     discoverer
   }
+
+  // never caller
+  override protected def buildDeserializer(pulsrSchema: SchemaInfo, jsonOpts: JSONOptionsInRead): Deserializer[Row] = ???
 }
 
 object FlinkPulsarSourceTest {

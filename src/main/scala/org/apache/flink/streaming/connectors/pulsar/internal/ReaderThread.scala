@@ -20,27 +20,27 @@ import org.apache.pulsar.client.api.{Message, MessageId, Reader, Schema}
 import org.apache.pulsar.client.impl.{BatchMessageIdImpl, MessageIdImpl}
 import org.apache.pulsar.common.schema.SchemaInfo
 
-class ReaderThread(
-    owner: PulsarFetcher,
+class ReaderThread[T](
+    owner: PulsarFetcher[T],
     state: PulsarTopicState,
     pulsarSchema: SchemaInfo,
     clientConf: ju.Map[String, Object],
     readerConf: ju.Map[String, Object],
     pollTimeoutMs: Int,
     jsonOptions: JSONOptionsInRead,
-    exceptionProxy: ExceptionProxy)
+    exceptionProxy: ExceptionProxy,
+    private var deserializer: Deserializer[T])
     extends Thread with Logging {
 
   import SourceSinkUtils._
 
-  val topic = state.topic
-  val startingOffsets = state.offset
+  val topic: String = state.topic
+  val startingOffsets: MessageId = state.offset
 
   @volatile private var running: Boolean = true
 
-  @volatile private var reader: Reader[_] = null
+  @volatile private var reader: Reader[_] = _
 
-  private val deserializer = new PulsarDeserializer(pulsarSchema, jsonOptions)
   private val schema: Schema[_] = SchemaUtils.getPSchema(pulsarSchema)
 
   override def run(): Unit = {

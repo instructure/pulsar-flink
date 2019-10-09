@@ -17,14 +17,13 @@ import org.apache.flink.core.testutils.{CheckedThread, OneShotLatch}
 import org.apache.flink.streaming.api.functions.source.SourceFunction.SourceContext
 import org.apache.flink.streaming.api.functions.{AssignerWithPeriodicWatermarks, AssignerWithPunctuatedWatermarks}
 import org.apache.flink.streaming.api.watermark.Watermark
-import org.apache.flink.streaming.connectors.pulsar.internal.{PulsarCommitCallback, PulsarFetcher}
+import org.apache.flink.streaming.connectors.pulsar.internal.{PulsarCommitCallback, PulsarFetcher, PulsarRowDeserializer}
 import org.apache.flink.streaming.connectors.pulsar.testutils.TestSourceContext
 import org.apache.flink.streaming.runtime.tasks.{ProcessingTimeService, TestProcessingTimeService}
 import org.apache.flink.types.Row
 import org.apache.flink.util.SerializedValue
 import org.apache.pulsar.client.api.MessageId
 import org.apache.pulsar.client.impl.MessageIdImpl
-import org.apache.pulsar.common.naming.TopicName
 
 import scala.collection.JavaConverters._
 
@@ -50,7 +49,7 @@ class PulsarFetcherTest extends PulsarFunSuite {
       })
 
       assert(fetcher.lastCommittedOffsets.isDefined)
-      assert(fetcher.lastCommittedOffsets.get.size == 0)
+      assert(fetcher.lastCommittedOffsets.get.isEmpty)
     }
   }
 
@@ -67,7 +66,7 @@ class PulsarFetcherTest extends PulsarFunSuite {
     val fetcher = new TestFetcher(
       sourceContext, offsets, null, null, new TestProcessingTimeService, 0, null, null)
 
-    val stateHolder = fetcher.getSubscribedTopicStates().get(0)
+    val stateHolder = fetcher.getSubscribedTopicStates.get(0)
     fetcher.emitRecord(longRow(1L), stateHolder, dummyMessageId(1))
     fetcher.emitRecord(longRow(2L), stateHolder, dummyMessageId(2))
     assert(2L == sourceContext.getLatestElement.getValue.getField(0))
@@ -94,7 +93,7 @@ class PulsarFetcherTest extends PulsarFunSuite {
       null,
       processingTimeProvider, 10, null, null)
 
-    val stateHolder = fetcher.getSubscribedTopicStates().get(0)
+    val stateHolder = fetcher.getSubscribedTopicStates.get(0)
 
     fetcher.emitRecord(longRow(1L), stateHolder, dummyMessageId(1))
     fetcher.emitRecord(longRow(2L), stateHolder, dummyMessageId(2))
@@ -135,7 +134,7 @@ class PulsarFetcherTest extends PulsarFunSuite {
       new SerializedValue(new PunctuatedTestLongRowExtractor()),
       new TestProcessingTimeService, 0, null, null)
 
-    val stateHolder = fetcher.getSubscribedTopicStates().get(0)
+    val stateHolder = fetcher.getSubscribedTopicStates.get(0)
 
     // elements generate a watermark if the timestamp is a multiple of three
     fetcher.emitRecord(longRow(1L), stateHolder, dummyMessageId(1))
@@ -178,9 +177,9 @@ class PulsarFetcherTest extends PulsarFunSuite {
       null,
       processingTimeService, 10, null, null)
 
-    val part1 = fetcher.getSubscribedTopicStates().get(0)
-    val part2 = fetcher.getSubscribedTopicStates().get(1)
-    val part3 = fetcher.getSubscribedTopicStates().get(2)
+    val part1 = fetcher.getSubscribedTopicStates.get(0)
+    val part2 = fetcher.getSubscribedTopicStates.get(1)
+    val part3 = fetcher.getSubscribedTopicStates.get(2)
 
     // elements for partition 1
     fetcher.emitRecord(longRow(1L), part1, dummyMessageId(1))
@@ -247,9 +246,9 @@ class PulsarFetcherTest extends PulsarFunSuite {
       new SerializedValue(new PunctuatedTestLongRowExtractor()),
       processingTimeService, 0, null, null)
 
-    val part1 = fetcher.getSubscribedTopicStates().get(0)
-    val part2 = fetcher.getSubscribedTopicStates().get(1)
-    val part3 = fetcher.getSubscribedTopicStates().get(2)
+    val part1 = fetcher.getSubscribedTopicStates.get(0)
+    val part2 = fetcher.getSubscribedTopicStates.get(1)
+    val part3 = fetcher.getSubscribedTopicStates.get(2)
 
     // elements generate a watermark if the timestamp is a multiple of three
 
@@ -319,7 +318,7 @@ class PulsarFetcherTest extends PulsarFunSuite {
     assert(!sourceContext.hasWatermark)
 
     fetcher.addDiscoveredTopics(Set(topicName(testTopic, 0)))
-    fetcher.emitRecord(longRow(100L), fetcher.getSubscribedTopicStates().get(0), dummyMessageId(3))
+    fetcher.emitRecord(longRow(100L), fetcher.getSubscribedTopicStates.get(0), dummyMessageId(3))
     processingTimeService.setCurrentTime(20)
     assert(100L == sourceContext.getLatestWatermark.getTimestamp)
   }
@@ -376,14 +375,16 @@ class TestFetcher(
   autoWatermarkInterval: Long,
   fetchLoopWaitLatch: OneShotLatch,
   stateIterationBlockLatch: OneShotLatch)
-  extends PulsarFetcher(
+  extends PulsarFetcher[Row](
   sourceContext,
   seedTopicsWithInitialOffsets,
   watermarksPeriodic,
   watermarksPunctuated,
   processingTimeProvider,
   autoWatermarkInterval,
-  getClass.getClassLoader, null, "", null, null, null, 0, null) {
+  getClass.getClassLoader,
+    null, "", null, null, null, 0, null,
+    (pulsarSchema, jsonOpts) => new PulsarRowDeserializer(pulsarSchema, jsonOpts)) {
 
   var lastCommittedOffsets: Option[Map[String, MessageId]] = None
 

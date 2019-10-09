@@ -37,7 +37,8 @@ import org.apache.pulsar.shade.org.apache.avro.Schema.Type.{ARRAY, BOOLEAN, BYTE
 import org.apache.pulsar.shade.org.apache.avro.generic.{GenericData, GenericFixed, GenericRecord}
 import org.apache.pulsar.shade.org.apache.avro.util.Utf8
 
-class PulsarDeserializer(schemaInfo: SchemaInfo, parsedOptions: JSONOptions) {
+class PulsarRowDeserializer(schemaInfo: SchemaInfo, parsedOptions: JSONOptions) extends
+  Deserializer[Row] {
 
   private lazy val decimalConversions = new DecimalConversion()
 
@@ -435,7 +436,7 @@ class PulsarDeserializer(schemaInfo: SchemaInfo, parsedOptions: JSONOptions) {
 
   final class RowUpdater extends FlinkDataUpdater {
 
-    var row: Row = null
+    var row: Row = _
 
     def setRow(currentRow: Row): Unit = {
       row = currentRow

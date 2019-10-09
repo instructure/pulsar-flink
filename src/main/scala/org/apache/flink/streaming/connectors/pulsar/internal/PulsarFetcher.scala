@@ -26,7 +26,6 @@ import org.apache.flink.streaming.api.functions.source.SourceFunction.SourceCont
 import org.apache.flink.streaming.api.operators.StreamingRuntimeContext
 import org.apache.flink.streaming.api.watermark.Watermark
 import org.apache.flink.streaming.runtime.tasks.{ProcessingTimeCallback, ProcessingTimeService}
-import org.apache.flink.types.Row
 import org.apache.flink.util.SerializedValue
 
 import org.apache.pulsar.client.api.MessageId
@@ -37,11 +36,11 @@ object NoWatermark extends TimestampWatermarkMode
 object PeriodicWatermark extends TimestampWatermarkMode
 object PunctuatedWatermark extends TimestampWatermarkMode
 
-class PulsarFetcher(
-    sourceContext: SourceContext[Row],
+class PulsarFetcher[T](
+    sourceContext: SourceContext[T],
     seedTopicsWithInitialOffsets: Map[String, MessageId],
-    watermarksPeriodic: SerializedValue[AssignerWithPeriodicWatermarks[Row]],
-    watermarksPunctuated: SerializedValue[AssignerWithPunctuatedWatermarks[Row]],
+    watermarksPeriodic: SerializedValue[AssignerWithPeriodicWatermarks[T]],
+    watermarksPunctuated: SerializedValue[AssignerWithPunctuatedWatermarks[T]],
     processingTimeProvider: ProcessingTimeService,
     autoWatermarkInterval: Long,
     userCodeClassLoader: ClassLoader,
@@ -51,7 +50,8 @@ class PulsarFetcher(
     readerConf: ju.Map[String, Object],
     metadataReader: PulsarMetadataReader,
     pollTimeoutMs: Int,
-    jsonOptions: JSONOptionsInRead) extends Logging {
+    jsonOptions: JSONOptionsInRead,
+    deserializerFactory: (SchemaInfo, JSONOptionsInRead) => Deserializer[T]) extends Logging {
 
   @volatile var running: Boolean = true
 
@@ -85,13 +85,13 @@ class PulsarFetcher(
       watermarkMode, watermarksPeriodic, watermarksPunctuated, userCodeClassLoader)
 
   protected val unassignedPartitionsQueue = new ClosableBlockingQueue[PulsarTopicState]()
-  subscribedTopicStates.asScala.foreach(unassignedPartitionsQueue.add(_))
+  subscribedTopicStates.asScala.foreach(unassignedPartitionsQueue.add)
 
   // if we have periodic watermarks, kick off the interval scheduler
   watermarkMode match {
     case PeriodicWatermark =>
       val periodicWatermarkEmitter =
-        new PeriodicWatermarkEmitter(
+        new PeriodicWatermarkEmitter[T](
           subscribedTopicStates,
           sourceContext,
           processingTimeProvider,
@@ -103,7 +103,7 @@ class PulsarFetcher(
   @throws[Exception]
   def runFetchLoop(): Unit = {
 
-    val topicToThread = mutable.HashMap.empty[String, ReaderThread]
+    val topicToThread = mutable.HashMap.empty[String, ReaderThread[T]]
 
     val exceptionProxy = new ExceptionProxy(Thread.currentThread())
 
@@ -144,7 +144,7 @@ class PulsarFetcher(
           deadThreads.foreach { case (tp, _) => topicToThread.remove(tp) }
         }
 
-        if (topicToThread.size == 0 && unassignedPartitionsQueue.isEmpty) {
+        if (topicToThread.isEmpty && unassignedPartitionsQueue.isEmpty) {
           if (unassignedPartitionsQueue.close()) {
             logInfo("All reader threads are finished, " +
               "there are no more unassigned partitions. Stopping fetcher")
@@ -239,7 +239,7 @@ class PulsarFetcher(
 
   def createAndStartReaderThread(
     topicStates: ju.List[PulsarTopicState],
-    exceptionProxy: ExceptionProxy): Map[String, ReaderThread] = {
+    exceptionProxy: ExceptionProxy): Map[String, ReaderThread[T]] = {
 
     val startingOffsets = topicStates.asScala.map(state => (state.topic, state.offset)).toMap
     metadataReader.setupCursor(startingOffsets)
@@ -253,7 +253,9 @@ class PulsarFetcher(
         readerConf,
         pollTimeoutMs,
         jsonOptions,
-        exceptionProxy)
+        exceptionProxy,
+        deserializerFactory(pulsarSchema, jsonOptions)
+      )
 
       readerT.setName(
         s"Pulsar Reader for ${state.topic} in task ${runtimeContext.getTaskName}")
@@ -268,8 +270,8 @@ class PulsarFetcher(
   def createTopicStateHolders(
       seedTopicsWithInitialOffsets: Map[String, MessageId],
       watermarkMode: TimestampWatermarkMode,
-      watermarksPeriodic: SerializedValue[AssignerWithPeriodicWatermarks[Row]],
-      watermarksPunctuated: SerializedValue[AssignerWithPunctuatedWatermarks[Row]],
+      watermarksPeriodic: SerializedValue[AssignerWithPeriodicWatermarks[T]],
+      watermarksPunctuated: SerializedValue[AssignerWithPunctuatedWatermarks[T]],
       userCodeClassLoader: ClassLoader): ju.List[PulsarTopicState] = {
 
     val topicStates = new CopyOnWriteArrayList[PulsarTopicState]()
@@ -324,7 +326,7 @@ class PulsarFetcher(
         }
     }
 
-    subscribedTopicStates.asScala.foreach{ case state =>
+    subscribedTopicStates.asScala.foreach { state =>
       val off = offset.get(state.topic)
       off match {
         case Some(mid) => state.committedOffset = mid
@@ -355,7 +357,7 @@ class PulsarFetcher(
    * @param offset         The offset of the record
    */
   def emitRecord(
-      record: Row,
+      record: T,
       topicState: PulsarTopicState,
       offset: MessageId): Unit = {
 
@@ -383,17 +385,17 @@ class PulsarFetcher(
    * also a periodic watermark generator.
    */
   private def emitRecordWithTimestampAndPeriodicWatermark(
-      record: Row,
+      record: T,
       topicState: PulsarTopicState,
       offset: MessageId,
       eventTimestamp: Long): Unit = {
 
-    val periodicState = topicState.asInstanceOf[PulsarTopicStateWithPeriodicWatermarks]
+    val periodicState = topicState.asInstanceOf[PulsarTopicStateWithPeriodicWatermarks[T]]
 
     var timestamp: Long = 0
 
     periodicState.synchronized {
-      timestamp = periodicState.getTimestampForRow(record, eventTimestamp)
+      timestamp = periodicState.getTimestampForRecord(record, eventTimestamp)
     }
 
     checkpointLock.synchronized {
@@ -407,13 +409,13 @@ class PulsarFetcher(
    * also a punctuated watermark generator.
    */
   private def emitRecordWithTimestampAndPunctuatedWatermark(
-      record: Row,
+      record: T,
       topicState: PulsarTopicState,
       offset: MessageId,
       eventTimestamp: Long): Unit = {
 
-    val punctuatedState = topicState.asInstanceOf[PulsarTopicStateWithPunctuatedWatermarks]
-    val timestamp = punctuatedState.getTimestampForRow(record, eventTimestamp)
+    val punctuatedState = topicState.asInstanceOf[PulsarTopicStateWithPunctuatedWatermarks[T]]
+    val timestamp = punctuatedState.getTimestampForRecord(record, eventTimestamp)
     val newWM = punctuatedState.checkAndGetNewWatermark(record, timestamp)
 
     checkpointLock.synchronized {
@@ -433,7 +435,7 @@ class PulsarFetcher(
     if (nextWatermark.getTimestamp > maxWatermarkSoFar) {
       var newMin = Long.MaxValue
       subscribedTopicStates.asScala.foreach { state =>
-        val puncState = state.asInstanceOf[PulsarTopicStateWithPunctuatedWatermarks]
+        val puncState = state.asInstanceOf[PulsarTopicStateWithPunctuatedWatermarks[T]]
         newMin = Math.min(newMin, puncState.getCurrentPartitionWatermark)
       }
 
@@ -449,7 +451,7 @@ class PulsarFetcher(
   }
 
   // for test purpose
-  def getSubscribedTopicStates(): ju.List[PulsarTopicState] = {
+  def getSubscribedTopicStates: ju.List[PulsarTopicState] = {
     subscribedTopicStates
   }
 }
@@ -458,9 +460,9 @@ class PulsarFetcher(
  * The periodic watermark emitter. In its given interval, it checks all partitions for
  * the current event time watermark, and possibly emits the next watermark.
  */
-class PeriodicWatermarkEmitter(
+class PeriodicWatermarkEmitter[T](
     allPartitions: ju.List[PulsarTopicState],
-    emitter: SourceFunction.SourceContext[_],
+    emitter: SourceFunction.SourceContext[T],
     timerService: ProcessingTimeService,
     interval: Long)
   extends ProcessingTimeCallback {
@@ -479,7 +481,7 @@ class PeriodicWatermarkEmitter(
     allPartitions.asScala.foreach { state =>
       var curr: Long = 0
       state.synchronized {
-        curr = state.asInstanceOf[PulsarTopicStateWithPeriodicWatermarks]
+        curr = state.asInstanceOf[PulsarTopicStateWithPeriodicWatermarks[T]]
           .getCurrentWatermarkTimestamp()
       }
       minAcrossAll = Math.min(minAcrossAll, curr)
